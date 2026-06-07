@@ -170,14 +170,16 @@ DatasetProfile ProfileBuilder::build() {
                 while (l > 0 && (buf[l-1]=='\n'||buf[l-1]=='\r')) buf[--l]='\0';
                 std::string hline(buf, l);
                 std::string nm;
+                size_t col_idx = 0;
                 for (size_t i = 0; i <= hline.size(); ++i) {
                     char c = (i < hline.size()) ? hline[i] : ',';
                     if (c == ',') {
                         // trim quotes
                         size_t s = nm.find_first_not_of(" \t\"");
                         size_t e = nm.find_last_not_of(" \t\"");
-                        if (s != std::string::npos)
-                            accs[profile.columns.size()].name = nm.substr(s, e-s+1);
+                        if (s != std::string::npos && col_idx < accs.size())
+                            accs[col_idx].name = nm.substr(s, e-s+1);
+                        col_idx++;
                         nm.clear();
                     } else { nm += c; }
                 }
