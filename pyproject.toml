@@ -41,7 +41,7 @@ ai  = ["openai>=1.0"]
 dev = ["pytest>=8.0", "pandas>=2.0", "numpy>=1.24"]
 
 [project.scripts]
-fasteda = "fasteda.cli:app"
+zedda = "zedda.cli:app"
 
 [project.urls]
 Homepage   = "https://github.com/prince3235/fasteda"
@@ -52,8 +52,8 @@ Issues     = "https://github.com/prince3235/fasteda/issues"
 [tool.scikit-build]
 cmake.build-type    = "Release"
 cmake.source-dir    = "."
-wheel.packages      = ["python/fasteda"]
-wheel.install-dir   = "fasteda"
+wheel.packages      = ["python/zedda"]
+wheel.install-dir   = "zedda"
 build-dir           = "build/{wheel_tag}"
 sdist.exclude       = [
     "*.exe", "*.pyd", "*.dll",
