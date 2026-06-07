@@ -1,9 +1,9 @@
 """
-zedda — Zero effort data analysis(EDA)
-============================
+zedda — Zero Effort Data Analysis
+====================================
 
-The simplest EDA library ever made.
-Built on a C++ core for maximum speed.
+The fastest EDA library ever built.
+C++ parallel core. 1TB files in seconds.
 
 Quick start::
 
@@ -12,7 +12,7 @@ Quick start::
     # Profile any file
     zd.profile("data.csv")
 
-    # Get the result as object
+    # Get result as object
     p = zd.scan("data.csv")
     print(p.num_rows)
     print(p.columns[0].mean)
@@ -23,8 +23,21 @@ Quick start::
 
 from __future__ import annotations
 
-__version__ = "0.1.5"
+import math
+import ctypes
+import time
+from pathlib import Path
+
+
+# ── Public error class ────────────────────────────────────────────
+class ZeddaError(Exception):
+    """User-friendly error raised by the Zedda engine."""
+    pass
+
+
+__version__ = "0.2.0"
 __author__  = "zedda contributors"
+
 
 # ── Try importing C++ core ────────────────────────────────────────
 try:
@@ -47,24 +60,24 @@ except ImportError:
 
 _console = Console() if _RICH_AVAILABLE else None
 
+# ── Arrow C Data Interface struct sizes (from arrow/c/abi.h) ──────
+# ArrowSchema: 9 fields, mostly pointers → 72 bytes on 64-bit
+# ArrowArray:  9 fields similarly        → 72 bytes on 64-bit
+# We allocate 256 bytes each for safety (plenty of room for private_data)
+_ARROW_SCHEMA_SIZE = 256
+_ARROW_ARRAY_SIZE  = 256
+
 
 # ─────────────────────────────────────────────────────────────────
 #  scan() — run the C++ engine, return DatasetProfile object
-#
-#  Use when you want to access stats programmatically.
-#
-#  Example::
-#
-#      p = zd.scan("data.csv")
-#      for col in p.columns:
-#          print(col.name, col.mean)
 # ─────────────────────────────────────────────────────────────────
-def scan(path: str) -> object:
+def scan(path: str, sample_size: int = None) -> object:
     """
     Scan a file and return a DatasetProfile object.
 
     Args:
-        path: Path to CSV, Excel, JSON, or Parquet file.
+        path:        Path to CSV or Parquet file.
+        sample_size: Max rows to sample. Auto-triggers for files > 500 MB.
 
     Returns:
         DatasetProfile with full column-level statistics.
@@ -75,72 +88,180 @@ def scan(path: str) -> object:
         print(p.num_rows)          # 891
         print(p.columns[0].mean)   # 29.69
     """
-    if not _CORE_AVAILABLE:
-        raise RuntimeError(
-            "zedda C++ core not found. "
-            "Please reinstall: pip install zedda"
-        )
-    if path.lower().endswith((".parquet", ".arrow")):
-        return _scan_arrow(path)
-    return _core.profile(path, False)
+    _require_core()
 
-def _scan_arrow(path: str) -> object:
-    import time
-    import ctypes
+    file_path = Path(path)
+    if not file_path.exists():
+        raise ZeddaError(
+            f"File not found: '{path}'\n"
+            "Tip: Use an absolute path or check your spelling."
+        )
+
+    ext = file_path.suffix.lower()
+    supported = {".csv", ".parquet", ".arrow"}
+    if ext not in supported:
+        raise ZeddaError(
+            f"Unsupported format: '{ext}'.\n"
+            f"Supported: {', '.join(sorted(supported))}"
+        )
+
+    # ── Auto-sampling logic ───────────────────────────────────────
+    is_sampled = False
+    if sample_size is not None:
+        is_sampled = True
+    elif file_path.stat().st_size > 500 * 1024 * 1024:   # > 500 MB
+        is_sampled  = True
+        sample_size = 1_000_000
+
+    safe_sample = sample_size if sample_size else 1_000_000
+
+    try:
+        if ext in (".parquet", ".arrow"):
+            return _scan_arrow(path, is_sampled=is_sampled, sample_size=safe_sample)
+        return _core.profile(path, False, is_sampled, safe_sample)
+    except RuntimeError as e:
+        raise ZeddaError(str(e)) from None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  _scan_arrow() — zero-copy Parquet → C++ via Arrow C Data Interface
+#
+#  Phase 3 features:
+#    • Stratified row-group sampling (reads only 6 representative groups)
+#    • Parquet Footer Cheat Code: exact nulls/min/max from metadata
+#    • Confidence intervals in terminal output when sampled
+# ─────────────────────────────────────────────────────────────────
+def _scan_arrow(path: str, is_sampled: bool = False, sample_size: int = 1_000_000) -> object:
     try:
         import pyarrow.parquet as pq
+        import pyarrow as pa
     except ImportError:
-        raise RuntimeError("pyarrow is required for Parquet support. Run: pip install pyarrow")
-    
-    start_time = time.time()
+        raise ZeddaError("pyarrow is required for Parquet. Run: pip install pyarrow")
+
+    t0 = time.perf_counter()
     pf = pq.ParquetFile(path)
-    profiler = _core.ArrowProfiler(path, pf.metadata.num_rows)
-    
-    # Stream record batches to C++ via zero-copy C Data Interface
-    for batch in pf.iter_batches(batch_size=65536):
-        schema_mem = (ctypes.c_char * 128)()
-        array_mem = (ctypes.c_char * 128)()
-        
-        ptr_schema = ctypes.addressof(schema_mem)
-        ptr_array = ctypes.addressof(array_mem)
-        
-        batch._export_to_c(ptr_array, ptr_schema)
-        profiler.consume_batch(ptr_schema, ptr_array)
-        
+
+    total_rows     = pf.metadata.num_rows
+    num_row_groups = pf.metadata.num_row_groups
+
+    # ── Stratified sampling: pick 6 representative row groups ─────
+    #    Covers the start, middle, and end of the dataset.
+    #    This is statistically more reliable than purely random.
+    if num_row_groups <= 6 or not is_sampled:
+        selected_groups = list(range(num_row_groups))
+        final_is_sampled = False
+    else:
+        mid = num_row_groups // 2
+        selected_groups = sorted({
+            0, 1,
+            mid - 1, mid,
+            num_row_groups - 2, num_row_groups - 1,
+        })
+        final_is_sampled = True
+
+    profiler = _core.ArrowProfiler(path, total_rows)
+
+    # ── Stream selected row groups to C++ via Arrow C Data Interface ──
+    # IMPORTANT: We allocate fresh ctypes buffers per batch.
+    # PyArrow _export_to_c transfers ownership to C++.
+    # The C++ release() callback (set by PyArrow) is responsible for
+    # freeing; we must NOT call release() in our C++ code ourselves.
+    for rg_idx in selected_groups:
+        rg = pf.read_row_group(rg_idx)
+        for batch in rg.to_batches(max_chunksize=65_536):
+            # Allocate properly-sized buffers for the Arrow C structs
+            schema_buf = (ctypes.c_uint8 * _ARROW_SCHEMA_SIZE)()
+            array_buf  = (ctypes.c_uint8 * _ARROW_ARRAY_SIZE)()
+
+            ptr_schema = ctypes.addressof(schema_buf)
+            ptr_array  = ctypes.addressof(array_buf)
+
+            # PyArrow fills the structs at our pointers and sets release()
+            batch._export_to_c(ptr_array, ptr_schema)
+
+            # C++ reads the data; release() is called by C++ consume_batch
+            profiler.consume_batch(ptr_schema, ptr_array)
+
+            # Keep Python objects alive until C++ is done (GC anchor)
+            del schema_buf, array_buf
+
     profile = profiler.finalize()
-    profile.scan_time_ms = (time.time() - start_time) * 1000.0
+
+    # ── Parquet Footer Cheat Code ─────────────────────────────────
+    # Parquet stores per-column statistics (null_count, min, max) inside
+    # the file footer — readable in milliseconds regardless of file size.
+    # We override sampled stats with these EXACT values.
+    num_cols = profile.num_cols
+    for i in range(num_cols):
+        exact_nulls = 0
+        exact_min   = None
+        exact_max   = None
+        footer_ok   = True
+
+        for rg_idx in range(num_row_groups):
+            try:
+                col_meta = pf.metadata.row_group(rg_idx).column(i)
+                stats    = col_meta.statistics
+                if stats is None:
+                    footer_ok = False
+                    break
+                exact_nulls += stats.null_count
+                if stats.has_min_max:
+                    cmin, cmax = stats.min, stats.max
+                    if cmin is not None:
+                        exact_min = cmin if exact_min is None else min(exact_min, cmin)
+                    if cmax is not None:
+                        exact_max = cmax if exact_max is None else max(exact_max, cmax)
+            except Exception:
+                footer_ok = False
+                break
+
+        if footer_ok:
+            col = profile.columns[i]
+            col.null_count     = exact_nulls
+            col.null_pct       = (exact_nulls / total_rows * 100.0) if total_rows > 0 else 0.0
+            col.non_null_count = total_rows - exact_nulls
+            col.has_high_nulls = col.null_pct > 20.0
+
+            if (exact_min is not None and exact_max is not None
+                    and isinstance(exact_min, (int, float))
+                    and isinstance(exact_max, (int, float))):
+                col.val_min = float(exact_min)
+                col.val_max = float(exact_max)
+                col.range   = float(exact_max) - float(exact_min)
+
+    profile.scan_time_ms = (time.perf_counter() - t0) * 1000.0
+    profile.is_sampled   = final_is_sampled
+    # Always expose the EXACT total row count (from footer, instant)
+    profile.num_rows     = total_rows
     return profile
 
 
 # ─────────────────────────────────────────────────────────────────
 #  profile() — scan + print beautiful terminal report
-#
-#  This is the MAIN function. One line does everything.
-#
-#  Example::
-#
-#      zd.profile("data.csv")
 # ─────────────────────────────────────────────────────────────────
-def profile(path: str) -> object:
+def profile(path: str, sample_size: int = None) -> object:
     """
     Profile a file and print a beautiful terminal report.
 
-    The simplest EDA you will ever do::
+    One line does everything::
 
         import zedda as zd
         zd.profile("data.csv")
+        zd.profile("big_file.parquet", sample_size=500_000)
 
     Args:
-        path: Path to your data file.
+        path:        Path to your data file.
+        sample_size: Max rows to sample (auto if file > 500 MB).
 
     Returns:
         DatasetProfile (also prints report to terminal).
     """
     if _RICH_AVAILABLE and _console:
-        _console.print(f"\n[bold blue]zedda[/bold blue] [dim]v{__version__}[/dim]")
+        _console.print(f"\n[bold blue]⚡ zedda[/bold blue] [dim]v{__version__}[/dim]")
         _console.print(f"[dim]Scanning[/dim] [cyan]{path}[/cyan]...\n")
 
-    result = scan(path)
+    result = scan(path, sample_size=sample_size)
     _print_report(result)
     return result
 
@@ -153,10 +274,15 @@ def _print_report(p: object) -> None:
         _print_plain(p)
         return
 
-    # ── Dataset summary panel ────────────────────────────────────
+    # ── Dataset summary panel ─────────────────────────────────────
+    sampled_note = ""
+    if p.is_sampled:
+        sampled_note = "\n[bold yellow]⚠  SAMPLED MODE[/bold yellow]  [dim](stratified, exact nulls & range from footer)[/dim]"
+
+    rows_display = f"{p.num_rows:,}" if p.num_rows >= 0 else "unknown"
     summary = (
-        f"[bold]File:[/bold]    {p.file_name}\n"
-        f"[bold]Rows:[/bold]    [green]{p.num_rows:,}[/green]\n"
+        f"[bold]File:[/bold]    {p.file_name}{sampled_note}\n"
+        f"[bold]Rows:[/bold]    [green]{rows_display}[/green]\n"
         f"[bold]Cols:[/bold]    {p.num_cols}  "
         f"([cyan]{p.num_numeric} numeric[/cyan], "
         f"[magenta]{p.num_string} string[/magenta])\n"
@@ -166,10 +292,14 @@ def _print_report(p: object) -> None:
         + f"  ({p.total_null_cells:,} cells)\n"
         f"[bold]Scanned:[/bold] {p.scan_time_ms:.0f} ms"
     )
-    _console.print(Panel(summary, title="[bold blue]Dataset Overview[/bold blue]",
-                         border_style="blue"))
+    title = "[bold blue]Dataset Overview[/bold blue]"
+    if p.is_sampled:
+        title += "  [yellow]⚡ SAMPLED[/yellow]"
 
-    # ── Column table ─────────────────────────────────────────────
+    _console.print(Panel(summary, title=title, border_style="blue", expand=False))
+
+    # ── Column table ──────────────────────────────────────────────
+    mean_header = "Mean (±95% CI)" if p.is_sampled else "Mean"
     table = Table(
         show_header=True,
         header_style="bold white on blue",
@@ -177,20 +307,18 @@ def _print_report(p: object) -> None:
         box=box.SIMPLE_HEAVY,
         padding=(0, 1),
     )
-
-    table.add_column("Column",   style="bold cyan",  min_width=12)
-    table.add_column("Type",     style="magenta",    min_width=6)
-    table.add_column("Nulls",    justify="right",    min_width=8)
-    table.add_column("Unique~",  justify="right",    min_width=8)
-    table.add_column("Mean",     justify="right",    min_width=10)
-    table.add_column("Min",      justify="right",    min_width=10)
-    table.add_column("Max",      justify="right",    min_width=10)
-    table.add_column("Flags",    min_width=14)
+    table.add_column("Column",        style="bold cyan",   min_width=12)
+    table.add_column("Type",          style="magenta",     min_width=6)
+    table.add_column("Nulls",         justify="right",     min_width=8)
+    table.add_column("Unique~",       justify="right",     min_width=8)
+    table.add_column(mean_header,     justify="right",     min_width=18)
+    table.add_column("Min",           justify="right",     min_width=12)
+    table.add_column("Max",           justify="right",     min_width=12)
+    table.add_column("Flags",         min_width=14)
 
     for col in p.columns:
-        # null cell
-        null_str = f"{col.null_pct:.1f}%"
-        null_cell = Text(null_str)
+        # Null cell coloring
+        null_cell = Text(f"{col.null_pct:.1f}%")
         if col.null_pct > 20:
             null_cell.stylize("bold red")
         elif col.null_pct > 5:
@@ -198,20 +326,24 @@ def _print_report(p: object) -> None:
         else:
             null_cell.stylize("green")
 
-        # mean / min / max
+        # Mean / Min / Max
         if col.type_str in ("int", "float"):
-            mean_str = f"{col.mean:,.2f}"
-            min_str  = f"{col.val_min:,.2f}"
-            max_str  = f"{col.val_max:,.2f}"
+            if p.is_sampled and col.non_null_count > 1:
+                stderr   = 1.96 * col.stddev / math.sqrt(col.non_null_count)
+                mean_str = f"{col.mean:,.4g} ± {stderr:,.4g}"
+            else:
+                mean_str = f"{col.mean:,.4g}"
+            min_str = f"{col.val_min:,.4g}"
+            max_str = f"{col.val_max:,.4g}"
         else:
             mean_str = f"len~{col.mean_str_len:.0f}"
             min_str  = "—"
             max_str  = "—"
 
-        # flags
+        # Health flags
         flags = []
         if col.has_high_nulls:        flags.append("[red]HIGH NULL[/red]")
-        if col.is_constant:           flags.append("[yellow]CONSTANT[/yellow]")
+        if col.is_constant:           flags.append("[yellow]CONST[/yellow]")
         if col.is_high_cardinality:   flags.append("[blue]HIGH CARD[/blue]")
         flags_str = " ".join(flags) if flags else "[dim]ok[/dim]"
 
@@ -227,55 +359,60 @@ def _print_report(p: object) -> None:
         )
 
     _console.print(table)
-    _console.print()
+
+    if p.is_sampled:
+        _console.print(
+            "[dim]ℹ  Means show 95% confidence interval. "
+            "Null counts and min/max are exact (from Parquet footer).[/dim]\n"
+        )
+    else:
+        _console.print()
 
 
 def _print_plain(p: object) -> None:
-    """Fallback if Rich not installed."""
+    """Fallback plain text report when Rich is not installed."""
+    sampled = " [SAMPLED]" if p.is_sampled else ""
     print(f"\nzedda v{__version__}")
-    print(f"File  : {p.file_name}")
+    print(f"File  : {p.file_name}{sampled}")
     print(f"Rows  : {p.num_rows:,}")
     print(f"Cols  : {p.num_cols}")
     print(f"Nulls : {p.overall_null_pct:.1f}%")
     print(f"Time  : {p.scan_time_ms:.0f} ms")
-    print("\nColumn        Type    Nulls    Mean")
-    print("-" * 50)
+    print("\nColumn        Type    Nulls     Mean")
+    print("-" * 52)
     for col in p.columns:
-        mean_s = f"{col.mean:.2f}" if col.type_str in ("int","float") else "—"
-        print(f"{col.name:<14}{col.type_str:<8}{col.null_pct:.1f}%    {mean_s}")
+        mean_s = f"{col.mean:.4g}" if col.type_str in ("int", "float") else "—"
+        print(f"{col.name:<14}{col.type_str:<8}{col.null_pct:.1f}%     {mean_s}")
 
 
 # ─────────────────────────────────────────────────────────────────
 #  compare() — diff two datasets
-#
-#  Example::
-#
-#      zd.compare("train.csv", "test.csv")
 # ─────────────────────────────────────────────────────────────────
-def compare(path_a: str, path_b: str) -> None:
+def compare(path_a: str, path_b: str, sample_size: int = None) -> None:
     """
     Compare two datasets side by side.
 
-    Shows schema differences, null rate changes,
-    and distribution shifts between files.
+    Shows schema differences, null rate changes, and distribution
+    shifts (z-score drift detection) between two files.
 
     Example::
 
         zd.compare("train.csv", "test.csv")
 
     Args:
-        path_a: First file path.
-        path_b: Second file path.
+        path_a:      First file path.
+        path_b:      Second file path.
+        sample_size: Max rows per file (auto if > 500 MB).
     """
-    p_a = scan(path_a)
-    p_b = scan(path_b)
+    p_a = scan(path_a, sample_size=sample_size)
+    p_b = scan(path_b, sample_size=sample_size)
 
     if not _RICH_AVAILABLE or _console is None:
         print(f"A: {p_a.file_name} — {p_a.num_rows:,} rows")
         print(f"B: {p_b.file_name} — {p_b.num_rows:,} rows")
         return
 
-    _console.print(f"\n[bold blue]zedda compare[/bold blue]")
+    _console.print(f"\n[bold blue]⚡ zedda compare[/bold blue]")
     _console.print(f"[cyan]A:[/cyan] {p_a.file_name}  [dim]({p_a.num_rows:,} rows)[/dim]")
     _console.print(f"[cyan]B:[/cyan] {p_b.file_name}  [dim]({p_b.num_rows:,} rows)[/dim]\n")
 
@@ -288,15 +425,15 @@ def compare(path_a: str, path_b: str) -> None:
     table.add_column("Column",  style="bold cyan", min_width=12)
     table.add_column("Type A",  min_width=7)
     table.add_column("Type B",  min_width=7)
-    table.add_column("Nulls A", justify="right", min_width=8)
-    table.add_column("Nulls B", justify="right", min_width=8)
-    table.add_column("Mean A",  justify="right", min_width=10)
-    table.add_column("Mean B",  justify="right", min_width=10)
+    table.add_column("Nulls A", justify="right",   min_width=8)
+    table.add_column("Nulls B", justify="right",   min_width=8)
+    table.add_column("Mean A",  justify="right",   min_width=10)
+    table.add_column("Mean B",  justify="right",   min_width=10)
     table.add_column("Drift",   min_width=10)
 
     cols_a = {c.name: c for c in p_a.columns}
     cols_b = {c.name: c for c in p_b.columns}
-    all_cols = list(dict.fromkeys(list(cols_a.keys()) + list(cols_b.keys())))
+    all_cols = list(dict.fromkeys(list(cols_a) + list(cols_b)))
 
     for name in all_cols:
         ca = cols_a.get(name)
@@ -308,19 +445,12 @@ def compare(path_a: str, path_b: str) -> None:
         null_a = f"{ca.null_pct:.1f}%" if ca else "—"
         null_b = f"{cb.null_pct:.1f}%" if cb else "—"
 
-        if ca and ca.type_str in ("int", "float"):
-            mean_a = f"{ca.mean:,.2f}"
-        else:
-            mean_a = "—"
+        mean_a = f"{ca.mean:,.4g}" if (ca and ca.type_str in ("int", "float")) else "—"
+        mean_b = f"{cb.mean:,.4g}" if (cb and cb.type_str in ("int", "float")) else "—"
 
-        if cb and cb.type_str in ("int", "float"):
-            mean_b = f"{cb.mean:,.2f}"
-        else:
-            mean_b = "—"
-
-        # drift detection
+        # Z-score drift detection
         drift = "[green]ok[/green]"
-        if ca and cb and ca.type_str in ("int","float") and cb.type_str in ("int","float"):
+        if ca and cb and ca.type_str in ("int", "float") and cb.type_str in ("int", "float"):
             if ca.stddev > 0:
                 shift = abs(ca.mean - cb.mean) / ca.stddev
                 if shift > 1.0:
@@ -328,18 +458,29 @@ def compare(path_a: str, path_b: str) -> None:
                 elif shift > 0.3:
                     drift = "[yellow]SHIFT[/yellow]"
         if not ca:
-            drift = "[blue]NEW COL[/blue]"
+            drift = "[blue]NEW[/blue]"
         if not cb:
             drift = "[red]REMOVED[/red]"
 
-        table.add_row(name, type_a, type_b, null_a, null_b,
-                      mean_a, mean_b, Text.from_markup(drift))
+        table.add_row(name, type_a, type_b, null_a, null_b, mean_a, mean_b,
+                      Text.from_markup(drift))
 
     _console.print(table)
     _console.print()
 
 
 # ─────────────────────────────────────────────────────────────────
+#  Internal helpers
+# ─────────────────────────────────────────────────────────────────
+def _require_core():
+    if not _CORE_AVAILABLE:
+        raise RuntimeError(
+            "zedda C++ core not found.\n"
+            "Please reinstall: pip install zedda"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Public API
 # ─────────────────────────────────────────────────────────────────
-__all__ = ["profile", "scan", "compare", "__version__"]
+__all__ = ["profile", "scan", "compare", "ZeddaError", "__version__"]

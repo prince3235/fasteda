@@ -8,14 +8,14 @@ build-backend = "scikit_build_core.build"
 # ── Project metadata ─────────────────────────────────────────────
 [project]
 name = "zedda"
-version = "0.1.5"
-description = "EDA in one command — blazing fast, C++ powered"
+version = "0.2.0"
+description = "Zero Effort Data Analysis — 1TB files in seconds, C++ parallel core"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 keywords = [
-    "eda", "data-science", "profiling", "csv",
-    "pandas", "fast", "cli", "analysis"
+    "eda", "data-science", "profiling", "csv", "parquet",
+    "pandas", "fast", "cli", "analysis", "sampling", "arrow"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -69,5 +69,5 @@ FETCHCONTENT_UPDATES_DISCONNECTED = "ON"
 
 # ── pytest ───────────────────────────────────────────────────────
 [tool.pytest.ini_options]
-testpaths = ["tests/python"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]

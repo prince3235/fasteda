@@ -27,14 +27,25 @@ CsvStreamReader::~CsvStreamReader() {
 bool CsvStreamReader::open() {
     file_ = fopen(path_.c_str(), "r");
     if (!file_) {
-        std::cerr << "[zedda] Cannot open file: " << path_ << "\n";
-        return false;
+        throw std::runtime_error(
+            "Cannot open file: '" + path_ + "'\n"
+            "Check: file exists, readable permissions, valid path");
+    }
+
+    // Validate it looks like text (not binary) by checking for NULL bytes
+    char probe[512];
+    size_t n = fread(probe, 1, 512, file_);
+    rewind(file_);
+    for (size_t i = 0; i < n; i++) {
+        if (probe[i] == '\0') {
+            throw std::runtime_error(
+                "File appears to be binary (contains NULL bytes), not CSV: " + path_);
+        }
     }
 
     if (config_.has_header) {
         if (!read_header()) {
-            std::cerr << "[zedda] Failed to read header from: " << path_ << "\n";
-            return false;
+            throw std::runtime_error("[zedda] Failed to read header from: " + path_);
         }
     }
 

@@ -164,10 +164,14 @@ void ArrowProfiler::consume_batch(uintptr_t schema_ptr, uintptr_t array_ptr) {
                 }
             }
         } else {
-            // Unhandled types
+            // Unhandled types — record as null
             for (int64_t i = 0; i < num_rows; ++i) accs_[col].update_null();
         }
     }
+    // NOTE: Do NOT call schema->release() or array->release() here.
+    // PyArrow set those release callbacks and owns the memory.
+    // Calling release() from C++ would cause a double-free / crash.
+    // PyArrow frees the structs when the Python batch object is GC'd.
 }
 
 DatasetProfile ArrowProfiler::finalize() {

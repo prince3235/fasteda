@@ -65,6 +65,7 @@ struct DatasetProfile {
 
     // timing
     double scan_time_ms = 0.0;
+    bool is_sampled = false;
 
     // per-column profiles
     std::vector<ColumnProfile> columns;

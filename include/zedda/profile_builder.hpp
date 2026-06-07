@@ -38,8 +38,9 @@ public:
     // Optional: called every chunk with rows scanned so far
     void set_progress(ProgressCallback cb) { progress_cb_ = cb; }
 
-    // Main entry — runs full pipeline, returns complete profile
-    DatasetProfile build();
+    // Main entry    // Start parallel profiling, returns the final DatasetProfile.
+    // If is_sampled is true, each thread will stop early after processing sample_size / num_threads rows.
+    DatasetProfile build(bool is_sampled = false, int64_t sample_size = 1000000);
 
 private:
     std::string         path_;

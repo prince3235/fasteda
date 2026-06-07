@@ -11,9 +11,15 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(MSVC)
-  add_compile_options(/O2 /W4)
+  add_compile_options(
+    /O2          # Speed optimize
+    /W3          # Warning level 3 (not overly pedantic)
+    /wd4996      # Silence: 'fopen' unsafe — we handle file safety ourselves
+    /wd4834      # Silence: discarding [[nodiscard]] return — intentional
+    /D_CRT_SECURE_NO_WARNINGS
+  )
 else()
-  add_compile_options(-O3 -Wall -Wextra)
+  add_compile_options(-O3 -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 # ── Python ───────────────────────────────────────────────────────

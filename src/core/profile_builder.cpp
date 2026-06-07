@@ -18,9 +18,15 @@
 #include <cstdlib>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <chrono>
 #include <stdexcept>
-#include <thread>
+#include <algorithm>
 #include <string_view>
+#include <thread>        // for hardware_concurrency only
+#include <future>
+#include <vector>
+#include "zedda/BS_thread_pool.hpp"
 
 // ── Portable 64-bit file seeking ─────────────────────────────────
 #ifdef _WIN32
@@ -174,7 +180,8 @@ static void do_thread_work(
     bool                            skip_header,
     const std::vector<std::string>& col_names,
     StreamReaderConfig              cfg,
-    ThreadResult&                   result)
+    ThreadResult&                   result,
+    int64_t                         max_rows)
 {
     size_t ncols = col_names.size();
     result.accs.resize(ncols);
@@ -259,6 +266,9 @@ static void do_thread_work(
             }
         }
         ++result.rows_done;
+        
+        // Stop early if we reached our stratified sample target
+        if (max_rows > 0 && result.rows_done >= max_rows) break;
     }
 
     fclose(f);
@@ -267,7 +277,7 @@ static void do_thread_work(
 // ─────────────────────────────────────────────────────────────────
 //  ProfileBuilder::build() — parallel multi-threaded CSV profiler
 // ─────────────────────────────────────────────────────────────────
-DatasetProfile ProfileBuilder::build() {
+DatasetProfile ProfileBuilder::build(bool is_sampled, int64_t sample_size) {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     // ── Step 1: Open file exactly ONCE — to read column names ────
@@ -305,26 +315,38 @@ DatasetProfile ProfileBuilder::build() {
         byte_ends[t]   = (t + 1 < num_threads) ? (t+1) * chunk : file_size;
     }
 
-    // ── Step 5: Launch worker threads ────────────────────────────
+    // ── Step 5: Launch worker threads using Thread Pool ──────────
     std::vector<ThreadResult> results(num_threads);
-    std::vector<std::thread>  threads;
-    threads.reserve(num_threads);
+    
+    // Global Thread Pool instance reused across profile calls
+    static BS::thread_pool pool; 
+    
+    std::vector<std::future<void>> futures;
+    futures.reserve(num_threads);
+    
+    int64_t rows_per_thread = is_sampled ? (sample_size / num_threads) : 0;
 
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back(
-            do_thread_work,
-            std::cref(path_),
-            byte_starts[t],
-            byte_ends[t],
-            (t == 0),            // only thread 0 skips the header row
-            std::cref(col_names),
-            config_,
-            std::ref(results[t])
-        );
+        futures.push_back(pool.submit_task([this, t, byte_start = byte_starts[t], byte_end = byte_ends[t], skip_header = (t == 0), &col_names, &results, rows_per_thread] {
+            do_thread_work(
+                this->path_,
+                byte_start,
+                byte_end,
+                skip_header,
+                col_names,
+                this->config_,
+                results[t],
+                rows_per_thread
+            );
+        }));
     }
 
-    // Wait for all threads to finish
-    for (auto& th : threads) th.join();
+    // Wait for all tasks to finish
+    for (auto& fut : futures) {
+        fut.wait();
+    }
+    
+    auto t_threads_done = std::chrono::high_resolution_clock::now();
 
     // ── Step 6: Merge all thread-local results ───────────────────
     //  Start with thread 0, merge in threads 1..N-1
@@ -344,16 +366,22 @@ DatasetProfile ProfileBuilder::build() {
     for (auto& acc : final_accs) acc.finalize();
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double thread_ms = std::chrono::duration<double, std::milli>(t_threads_done - t0).count();
+    double merge_ms = std::chrono::duration<double, std::milli>(t1 - t_threads_done).count();
+    
+    // Print chrono benchmarks (Con 3)
+    printf("[zedda info] Profiler timing: %d threads processed chunks in %.1f ms | Merge took %.1f ms\n", 
+           num_threads, thread_ms, merge_ms);
 
     if (progress_cb_) progress_cb_(total_rows);
 
     // ── Step 8: Assemble DatasetProfile ──────────────────────────
     DatasetProfile profile;
     profile.file_path    = path_;
-    profile.num_rows     = total_rows;
+    profile.num_rows     = total_rows;   // rows actually scanned
     profile.num_cols     = static_cast<int64_t>(ncols);
-    profile.scan_time_ms = ms;
+    profile.scan_time_ms = thread_ms + merge_ms;
+    profile.is_sampled   = is_sampled;
 
     // file_name = last path component
     size_t slash = path_.find_last_of("/\\");
