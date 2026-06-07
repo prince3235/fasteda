@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 # ── Project metadata ─────────────────────────────────────────────
 [project]
 name = "zedda"
-version = "0.1.1"
+version = "0.1.2"
 description = "EDA in one command — blazing fast, C++ powered"
 readme = "README.md"
 license = { text = "MIT" }
