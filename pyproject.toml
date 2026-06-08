@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 # ── Project metadata ─────────────────────────────────────────────
 [project]
 name = "zedda"
-version = "0.2.0"
+version = "0.2.1"
 description = "Zero Effort Data Analysis — 1TB files in seconds, C++ parallel core"
 readme = "README.md"
 license = { text = "MIT" }
@@ -45,9 +45,9 @@ dev = ["pytest>=8.0", "pandas>=2.0", "numpy>=1.24"]
 zedda = "zedda.cli:app"
 
 [project.urls]
-Homepage   = "https://github.com/prince3235/fasteda"
-Repository = "https://github.com/prince3235/fasteda"
-Issues     = "https://github.com/prince3235/fasteda/issues"
+Homepage   = "https://github.com/prince3235/Zedda"
+Repository = "https://github.com/prince3235/Zedda"
+Issues     = "https://github.com/prince3235/Zedda/issues"
 
 # ── scikit-build-core ────────────────────────────────────────────
 [tool.scikit-build]

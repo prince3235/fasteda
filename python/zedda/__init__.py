@@ -1,5 +1,5 @@
 """
-zedda — Zero Effort Data Analysis
+zedda - Zero Effort Data Analysis
 ====================================
 
 The fastest EDA library ever built.
@@ -35,7 +35,7 @@ class ZeddaError(Exception):
     pass
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__  = "zedda contributors"
 
 
@@ -68,8 +68,18 @@ _ARROW_SCHEMA_SIZE = 256
 _ARROW_ARRAY_SIZE  = 256
 
 
+# _format_num helper for cleaner number formatting
+def _format_num(val: float) -> str:
+    if val == 0.0: return "0"
+    abs_val = abs(val)
+    if abs_val >= 1_000_000:  return f"{val:,.0f}"
+    elif abs_val >= 1_000:    return f"{val:,.1f}"
+    elif abs_val >= 1:        return f"{val:.4f}"
+    elif abs_val >= 0.001:    return f"{val:.6f}"
+    else:                     return f"{val:.2e}"
+
 # ─────────────────────────────────────────────────────────────────
-#  scan() — run the C++ engine, return DatasetProfile object
+#  scan() - run the C++ engine, return DatasetProfile object
 # ─────────────────────────────────────────────────────────────────
 def scan(path: str, sample_size: int = None) -> object:
     """
@@ -109,9 +119,9 @@ def scan(path: str, sample_size: int = None) -> object:
     is_sampled = False
     if sample_size is not None:
         is_sampled = True
-    elif file_path.stat().st_size > 500 * 1024 * 1024:   # > 500 MB
+    elif file_path.stat().st_size > 1024 * 1024 * 1024:   # 1GB
         is_sampled  = True
-        sample_size = 1_000_000
+        sample_size = 2_000_000
 
     safe_sample = sample_size if sample_size else 1_000_000
 
@@ -124,7 +134,7 @@ def scan(path: str, sample_size: int = None) -> object:
 
 
 # ─────────────────────────────────────────────────────────────────
-#  _scan_arrow() — zero-copy Parquet → C++ via Arrow C Data Interface
+#  _scan_arrow() - zero-copy Parquet → C++ via Arrow C Data Interface
 #
 #  Phase 3 features:
 #    • Stratified row-group sampling (reads only 6 representative groups)
@@ -189,7 +199,7 @@ def _scan_arrow(path: str, is_sampled: bool = False, sample_size: int = 1_000_00
 
     # ── Parquet Footer Cheat Code ─────────────────────────────────
     # Parquet stores per-column statistics (null_count, min, max) inside
-    # the file footer — readable in milliseconds regardless of file size.
+    # the file footer - readable in milliseconds regardless of file size.
     # We override sampled stats with these EXACT values.
     num_cols = profile.num_cols
     for i in range(num_cols):
@@ -238,7 +248,7 @@ def _scan_arrow(path: str, is_sampled: bool = False, sample_size: int = 1_000_00
 
 
 # ─────────────────────────────────────────────────────────────────
-#  profile() — scan + print beautiful terminal report
+#  profile() - scan + print beautiful terminal report
 # ─────────────────────────────────────────────────────────────────
 def profile(path: str, sample_size: int = None) -> object:
     """
@@ -258,7 +268,7 @@ def profile(path: str, sample_size: int = None) -> object:
         DatasetProfile (also prints report to terminal).
     """
     if _RICH_AVAILABLE and _console:
-        _console.print(f"\n[bold blue]⚡ zedda[/bold blue] [dim]v{__version__}[/dim]")
+        _console.print(f"\n[bold blue]zedda[/bold blue] [dim]v{__version__}[/dim]")
         _console.print(f"[dim]Scanning[/dim] [cyan]{path}[/cyan]...\n")
 
     result = scan(path, sample_size=sample_size)
@@ -267,7 +277,7 @@ def profile(path: str, sample_size: int = None) -> object:
 
 
 # ─────────────────────────────────────────────────────────────────
-#  _print_report() — beautiful Rich terminal output
+#  _print_report() - beautiful Rich terminal output
 # ─────────────────────────────────────────────────────────────────
 def _print_report(p: object) -> None:
     if not _RICH_AVAILABLE or _console is None:
@@ -294,9 +304,20 @@ def _print_report(p: object) -> None:
     )
     title = "[bold blue]Dataset Overview[/bold blue]"
     if p.is_sampled:
-        title += "  [yellow]⚡ SAMPLED[/yellow]"
+        title += "  [yellow]SAMPLED[/yellow]"
 
     _console.print(Panel(summary, title=title, border_style="blue", expand=False))
+
+    # ── Data Quality Score ────────────────────────────────────────
+    q_score = _quality_score(p)
+    blocks_filled = int(q_score / 10)
+    blocks = "#" * blocks_filled + "-" * (10 - blocks_filled)
+    
+    if q_score >= 80:     q_color, q_label = "green", "GOOD"
+    elif q_score >= 60:   q_color, q_label = "yellow", "FAIR"
+    else:                 q_color, q_label = "red", "POOR"
+    
+    _console.print(f"\nData Quality Score: {q_score}/100  [{blocks}]  [{q_color}]{q_label}[/{q_color}]\n")
 
     # ── Column table ──────────────────────────────────────────────
     mean_header = "Mean (±95% CI)" if p.is_sampled else "Mean"
@@ -330,15 +351,15 @@ def _print_report(p: object) -> None:
         if col.type_str in ("int", "float"):
             if p.is_sampled and col.non_null_count > 1:
                 stderr   = 1.96 * col.stddev / math.sqrt(col.non_null_count)
-                mean_str = f"{col.mean:,.4g} ± {stderr:,.4g}"
+                mean_str = f"{_format_num(col.mean)} ± {_format_num(stderr)}"
             else:
-                mean_str = f"{col.mean:,.4g}"
-            min_str = f"{col.val_min:,.4g}"
-            max_str = f"{col.val_max:,.4g}"
+                mean_str = f"{_format_num(col.mean)}"
+            min_str = f"{_format_num(col.val_min)}"
+            max_str = f"{_format_num(col.val_max)}"
         else:
             mean_str = f"len~{col.mean_str_len:.0f}"
-            min_str  = "—"
-            max_str  = "—"
+            min_str  = "-"
+            max_str  = "-"
 
         # Health flags
         flags = []
@@ -347,8 +368,9 @@ def _print_report(p: object) -> None:
         if col.is_high_cardinality:   flags.append("[blue]HIGH CARD[/blue]")
         flags_str = " ".join(flags) if flags else "[dim]ok[/dim]"
 
+        col_name = col.name if len(col.name) <= 18 else col.name[:16] + ".."
         table.add_row(
-            col.name,
+            col_name,
             col.type_str,
             null_cell,
             str(col.unique_approx),
@@ -362,12 +384,77 @@ def _print_report(p: object) -> None:
 
     if p.is_sampled:
         _console.print(
-            "[dim]ℹ  Means show 95% confidence interval. "
+            "[dim]i  Means show 95% confidence interval. "
             "Null counts and min/max are exact (from Parquet footer).[/dim]\n"
         )
     else:
         _console.print()
 
+    # ── Smart Warnings ────────────────────────────────────────────
+    warnings = []
+    for col in p.columns:
+        # High nulls warning
+        if col.null_pct > 20:
+            warnings.append(f"[red]![/red]  '{col.name}' - {col.null_pct:.1f}% missing. Consider dropping or imputing.")
+        
+        # Constant column warning
+        if col.is_constant:
+            warnings.append(f"[yellow]![/yellow]  '{col.name}' - only 1 unique value. Useless for ML, drop it.")
+        
+        # Possible ID column (very high cardinality on int)
+        if col.type_str == "int" and col.unique_pct > 95:
+            warnings.append(f"[blue]i[/blue]  '{col.name}' - {col.unique_pct:.0f}% unique. Looks like an ID column.")
+        
+        # Possible binary target column
+        if col.unique_approx == 2 and col.type_str == "int":
+            warnings.append(f"[green]v[/green]  '{col.name}' - binary column (2 values). Good ML target candidate.")
+        
+        # Extreme outlier hint (if max >> mean by 10x)
+        if col.type_str in ("int", "float") and col.mean > 0:
+            if col.val_max > col.mean * 10:
+                warnings.append(f"[yellow]![/yellow]  '{col.name}' - max ({_format_num(col.val_max)}) is {col.val_max/col.mean:.0f}x above mean. Outliers likely.")
+
+    if warnings:
+        _console.print("[bold]Smart Warnings:[/bold]")
+        for w in warnings:
+            _console.print(f"  {w}")
+        _console.print()
+
+    # ── Correlation Alerts ────────────────────────────────────────
+    _correlation_alerts(p, _console)
+
+
+def _quality_score(p) -> int:
+    score = 100
+    # Penalize nulls
+    score -= min(40, int(p.overall_null_pct * 2))
+    # Penalize high-null columns (>20%)
+    high_null_cols = sum(1 for c in p.columns if c.has_high_nulls)
+    score -= min(20, high_null_cols * 5)
+    # Penalize constant columns (no variance)
+    constant_cols = sum(1 for c in p.columns if c.is_constant)
+    score -= min(20, constant_cols * 10)
+    return max(0, score)
+
+def _correlation_alerts(p, console) -> None:
+    numeric_cols = [c for c in p.columns if c.type_str in ("int", "float") and not c.is_constant]
+    
+    alerts = []
+    for i in range(len(numeric_cols)):
+        for j in range(i + 1, len(numeric_cols)):
+            ca, cb = numeric_cols[i], numeric_cols[j]
+            # Heuristic: if both have same range direction and similar unique counts
+            # flag as potentially correlated for user to investigate
+            if ca.unique_approx > 0 and cb.unique_approx > 0:
+                ratio = min(ca.unique_approx, cb.unique_approx) / max(ca.unique_approx, cb.unique_approx)
+                if ratio > 0.92:  # very similar cardinality = possible correlation
+                    alerts.append(f"[blue]<->[/blue]  '{ca.name}' <-> '{cb.name}' - similar cardinality ({ca.unique_approx:,} vs {cb.unique_approx:,}). Check for correlation.")
+    
+    if alerts:
+        console.print("[bold]Correlation Alerts:[/bold] [dim](investigate these pairs)[/dim]")
+        for a in alerts[:5]:  # max 5 alerts to avoid noise
+            console.print(f"  {a}")
+        console.print()
 
 def _print_plain(p: object) -> None:
     """Fallback plain text report when Rich is not installed."""
@@ -381,12 +468,13 @@ def _print_plain(p: object) -> None:
     print("\nColumn        Type    Nulls     Mean")
     print("-" * 52)
     for col in p.columns:
-        mean_s = f"{col.mean:.4g}" if col.type_str in ("int", "float") else "—"
-        print(f"{col.name:<14}{col.type_str:<8}{col.null_pct:.1f}%     {mean_s}")
+        mean_s = f"{_format_num(col.mean)}" if col.type_str in ("int", "float") else "-"
+        col_name = col.name if len(col.name) <= 12 else col.name[:10] + ".."
+        print(f"{col_name:<14}{col.type_str:<8}{col.null_pct:.1f}%     {mean_s}")
 
 
 # ─────────────────────────────────────────────────────────────────
-#  compare() — diff two datasets
+#  compare() - diff two datasets
 # ─────────────────────────────────────────────────────────────────
 def compare(path_a: str, path_b: str, sample_size: int = None) -> None:
     """
@@ -408,11 +496,11 @@ def compare(path_a: str, path_b: str, sample_size: int = None) -> None:
     p_b = scan(path_b, sample_size=sample_size)
 
     if not _RICH_AVAILABLE or _console is None:
-        print(f"A: {p_a.file_name} — {p_a.num_rows:,} rows")
-        print(f"B: {p_b.file_name} — {p_b.num_rows:,} rows")
+        print(f"A: {p_a.file_name} - {p_a.num_rows:,} rows")
+        print(f"B: {p_b.file_name} - {p_b.num_rows:,} rows")
         return
 
-    _console.print(f"\n[bold blue]⚡ zedda compare[/bold blue]")
+    _console.print(f"\n[bold blue]zedda compare[/bold blue]")
     _console.print(f"[cyan]A:[/cyan] {p_a.file_name}  [dim]({p_a.num_rows:,} rows)[/dim]")
     _console.print(f"[cyan]B:[/cyan] {p_b.file_name}  [dim]({p_b.num_rows:,} rows)[/dim]\n")
 
@@ -442,11 +530,11 @@ def compare(path_a: str, path_b: str, sample_size: int = None) -> None:
         type_a = ca.type_str if ca else "[red]MISSING[/red]"
         type_b = cb.type_str if cb else "[red]MISSING[/red]"
 
-        null_a = f"{ca.null_pct:.1f}%" if ca else "—"
-        null_b = f"{cb.null_pct:.1f}%" if cb else "—"
+        null_a = f"{ca.null_pct:.1f}%" if ca else "-"
+        null_b = f"{cb.null_pct:.1f}%" if cb else "-"
 
-        mean_a = f"{ca.mean:,.4g}" if (ca and ca.type_str in ("int", "float")) else "—"
-        mean_b = f"{cb.mean:,.4g}" if (cb and cb.type_str in ("int", "float")) else "—"
+        mean_a = f"{_format_num(ca.mean)}" if (ca and ca.type_str in ("int", "float")) else "-"
+        mean_b = f"{_format_num(cb.mean)}" if (cb and cb.type_str in ("int", "float")) else "-"
 
         # Z-score drift detection
         drift = "[green]ok[/green]"
