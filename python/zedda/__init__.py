@@ -35,7 +35,7 @@ class ZeddaError(Exception):
     pass
 
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __author__  = "zedda contributors"
 
 
@@ -68,15 +68,34 @@ _ARROW_SCHEMA_SIZE = 256
 _ARROW_ARRAY_SIZE  = 256
 
 
+_SAMPLED_INFO = {}
+
+
 # _format_num helper for cleaner number formatting
-def _format_num(val: float) -> str:
+def _format_num(val: float, is_integer: bool = False) -> str:
     if val == 0.0: return "0"
+    if is_integer:
+        return f"{int(val):,}"
     abs_val = abs(val)
     if abs_val >= 1_000_000:  return f"{val:,.0f}"
     elif abs_val >= 1_000:    return f"{val:,.1f}"
     elif abs_val >= 1:        return f"{val:.4f}"
     elif abs_val >= 0.001:    return f"{val:.6f}"
     else:                     return f"{val:.2e}"
+
+def _count_lines(path: str) -> int:
+    try:
+        count = 0
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
+        return count
+    except Exception:
+        return 0
+
 
 # ─────────────────────────────────────────────────────────────────
 #  scan() - run the C++ engine, return DatasetProfile object
@@ -128,7 +147,11 @@ def scan(path: str, sample_size: int = None) -> object:
     try:
         if ext in (".parquet", ".arrow"):
             return _scan_arrow(path, is_sampled=is_sampled, sample_size=safe_sample)
-        return _core.profile(path, False, is_sampled, safe_sample)
+        profile = _core.profile(path, False, is_sampled, safe_sample)
+        if is_sampled:
+            total_rows = _count_lines(path)
+            _SAMPLED_INFO[path] = (profile.num_rows, total_rows)
+        return profile
     except RuntimeError as e:
         raise ZeddaError(str(e)) from None
 
@@ -242,8 +265,15 @@ def _scan_arrow(path: str, is_sampled: bool = False, sample_size: int = 1_000_00
 
     profile.scan_time_ms = (time.perf_counter() - t0) * 1000.0
     profile.is_sampled   = final_is_sampled
-    # Always expose the EXACT total row count (from footer, instant)
-    profile.num_rows     = total_rows
+    
+    if final_is_sampled:
+        scanned_rows = profile.num_rows
+        _SAMPLED_INFO[path] = (scanned_rows, total_rows)
+        # Keep profile.num_rows as scanned_rows for visual overview and footer
+        profile.num_rows = scanned_rows
+    else:
+        profile.num_rows = total_rows
+
     return profile
 
 
@@ -279,48 +309,82 @@ def profile(path: str, sample_size: int = None) -> object:
 # ─────────────────────────────────────────────────────────────────
 #  _print_report() - beautiful Rich terminal output
 # ─────────────────────────────────────────────────────────────────
+def _collect_warnings(p: object) -> list[str]:
+    warnings = []
+    for col in p.columns:
+        # High nulls warning
+        if col.null_pct > 20:
+            warnings.append(f"[red]⚠[/red]  '{col.name}' — {col.null_pct:.1f}% missing. Consider dropping or imputing.")
+        
+        # Constant column warning
+        if col.is_constant:
+            warnings.append(f"[yellow]⚠[/yellow]  '{col.name}' — only 1 unique value. Useless for ML, drop it.")
+        
+        # Possible ID column (very high cardinality on int)
+        if col.type_str == "int" and col.unique_pct > 95:
+            warnings.append(f"[blue]i[/blue]  '{col.name}' — {col.unique_pct:.0f}% unique. Looks like an ID column.")
+        
+        # Possible binary target candidate warning/info
+        if col.unique_approx <= 3 and col.type_str == "int" and col.val_min == 0 and col.val_max == 1:
+            warnings.append(f"[green]v[/green]  '{col.name}' — binary column (0/1). Good ML target candidate.")
+        
+        # Extreme outlier hint (if max >> mean by 10x)
+        if col.type_str in ("int", "float") and col.mean > 0 and col.unique_approx > 5 and col.val_max > 10:
+            if col.val_max > col.mean * 10:
+                is_int = col.type_str == "int"
+                warnings.append(f"[yellow]⚠[/yellow]  '{col.name}' — max ({_format_num(col.val_max, is_int)}) is {col.val_max/col.mean:.0f}x above mean. Outliers likely.")
+    return warnings
+
+
+# ─────────────────────────────────────────────────────────────────
+#  _print_report() - beautiful Rich terminal output
+# ─────────────────────────────────────────────────────────────────
 def _print_report(p: object) -> None:
     if not _RICH_AVAILABLE or _console is None:
         _print_plain(p)
         return
 
     # ── Dataset summary panel ─────────────────────────────────────
-    sampled_note = ""
+    title = "[bold blue]Dataset Overview[/bold blue]"
+    sampled_lines = ""
     if p.is_sampled:
-        sampled_note = "\n[bold yellow]⚠  SAMPLED MODE[/bold yellow]  [dim](stratified, exact nulls & range from footer)[/dim]"
+        title += "  [yellow]⚡ SAMPLED[/yellow]"
+        scanned_rows, total_rows = _SAMPLED_INFO.get(p.file_path, (p.num_rows, p.num_rows))
+        sample_pct = (scanned_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+        is_parquet = Path(p.file_path).suffix.lower() in (".parquet", ".arrow")
+        method_str = "nulls/min/max exact from footer" if is_parquet else "early-stop/reservoir sampling"
+        sampled_lines = (
+            f"\n  [yellow]⚡ SAMPLED[/yellow]  [dim]{scanned_rows:,} of {total_rows:,} rows ({sample_pct:.1f}%)[/dim]"
+            f"\n            [dim]{method_str}[/dim]"
+        )
 
     rows_display = f"{p.num_rows:,}" if p.num_rows >= 0 else "unknown"
+    
+    scan_ms = p.scan_time_ms
+    if scan_ms >= 10_000:
+        scan_str = f"{scan_ms/1000:.1f} sec"
+    else:
+        scan_str = f"{scan_ms:.0f} ms"
+
     summary = (
-        f"[bold]File:[/bold]    {p.file_name}{sampled_note}\n"
-        f"[bold]Rows:[/bold]    [green]{rows_display}[/green]\n"
-        f"[bold]Cols:[/bold]    {p.num_cols}  "
+        f"[bold]File:[/bold]     {p.file_name}{sampled_lines}\n"
+        f"[bold]Rows:[/bold]     [green]{rows_display}[/green]\n"
+        f"[bold]Cols:[/bold]     {p.num_cols}  "
         f"([cyan]{p.num_numeric} numeric[/cyan], "
         f"[magenta]{p.num_string} string[/magenta])\n"
-        f"[bold]Nulls:[/bold]   "
+        f"[bold]Nulls:[/bold]    "
         + ("[red]" if p.overall_null_pct > 10 else "[green]")
         + f"{p.overall_null_pct:.1f}%[/]"
         + f"  ({p.total_null_cells:,} cells)\n"
-        f"[bold]Scanned:[/bold] {p.scan_time_ms:.0f} ms"
+        f"[bold]Scanned:[/bold]  {scan_str}"
     )
-    title = "[bold blue]Dataset Overview[/bold blue]"
-    if p.is_sampled:
-        title += "  [yellow]SAMPLED[/yellow]"
 
     _console.print(Panel(summary, title=title, border_style="blue", expand=False))
 
     # ── Data Quality Score ────────────────────────────────────────
-    q_score = _quality_score(p)
-    blocks_filled = int(q_score / 10)
-    blocks = "#" * blocks_filled + "-" * (10 - blocks_filled)
-    
-    if q_score >= 80:     q_color, q_label = "green", "GOOD"
-    elif q_score >= 60:   q_color, q_label = "yellow", "FAIR"
-    else:                 q_color, q_label = "red", "POOR"
-    
-    _console.print(f"\nData Quality Score: {q_score}/100  [{blocks}]  [{q_color}]{q_label}[/{q_color}]\n")
+    _quality_score_display(p, _console)
 
     # ── Column table ──────────────────────────────────────────────
-    mean_header = "Mean (±95% CI)" if p.is_sampled else "Mean"
     table = Table(
         show_header=True,
         header_style="bold white on blue",
@@ -332,11 +396,13 @@ def _print_report(p: object) -> None:
     table.add_column("Type",          style="magenta",     min_width=6)
     table.add_column("Nulls",         justify="right",     min_width=8)
     table.add_column("Unique~",       justify="right",     min_width=8)
-    table.add_column(mean_header,     justify="right",     min_width=18)
+    table.add_column("Mean",          justify="right",     min_width=12)
+    table.add_column("CI ±95%",       justify="right",     min_width=10)
     table.add_column("Min",           justify="right",     min_width=12)
     table.add_column("Max",           justify="right",     min_width=12)
     table.add_column("Flags",         min_width=14)
 
+    truncated_names = []
     for col in p.columns:
         # Null cell coloring
         null_cell = Text(f"{col.null_pct:.1f}%")
@@ -347,17 +413,20 @@ def _print_report(p: object) -> None:
         else:
             null_cell.stylize("green")
 
-        # Mean / Min / Max
+        # Mean / Min / Max / CI
+        is_int = col.type_str == "int"
         if col.type_str in ("int", "float"):
+            mean_str = f"{_format_num(col.mean, is_int)}"
             if p.is_sampled and col.non_null_count > 1:
                 stderr   = 1.96 * col.stddev / math.sqrt(col.non_null_count)
-                mean_str = f"{_format_num(col.mean)} ± {_format_num(stderr)}"
+                ci_str   = f"±{_format_num(stderr)}"
             else:
-                mean_str = f"{_format_num(col.mean)}"
-            min_str = f"{_format_num(col.val_min)}"
-            max_str = f"{_format_num(col.val_max)}"
+                ci_str   = "—"
+            min_str = f"{_format_num(col.val_min, is_int)}"
+            max_str = f"{_format_num(col.val_max, is_int)}"
         else:
             mean_str = f"len~{col.mean_str_len:.0f}"
+            ci_str   = "—"
             min_str  = "-"
             max_str  = "-"
 
@@ -368,13 +437,20 @@ def _print_report(p: object) -> None:
         if col.is_high_cardinality:   flags.append("[blue]HIGH CARD[/blue]")
         flags_str = " ".join(flags) if flags else "[dim]ok[/dim]"
 
-        col_name = col.name if len(col.name) <= 18 else col.name[:16] + ".."
+        # Column name truncation & hover footprint
+        if len(col.name) > 16:
+            col_display = col.name[:15] + "…"
+            truncated_names.append(col.name)
+        else:
+            col_display = col.name
+
         table.add_row(
-            col_name,
+            col_display,
             col.type_str,
             null_cell,
             str(col.unique_approx),
             mean_str,
+            ci_str,
             min_str,
             max_str,
             Text.from_markup(flags_str),
@@ -382,49 +458,34 @@ def _print_report(p: object) -> None:
 
     _console.print(table)
 
-    if p.is_sampled:
-        _console.print(
-            "[dim]i  Means show 95% confidence interval. "
-            "Null counts and min/max are exact (from Parquet footer).[/dim]\n"
-        )
+    if truncated_names:
+        _console.print("[dim]  * Full column names: " + " | ".join(truncated_names) + "[/dim]\n")
     else:
         _console.print()
 
     # ── Smart Warnings ────────────────────────────────────────────
-    warnings = []
-    for col in p.columns:
-        # High nulls warning
-        if col.null_pct > 20:
-            warnings.append(f"[red]![/red]  '{col.name}' - {col.null_pct:.1f}% missing. Consider dropping or imputing.")
-        
-        # Constant column warning
-        if col.is_constant:
-            warnings.append(f"[yellow]![/yellow]  '{col.name}' - only 1 unique value. Useless for ML, drop it.")
-        
-        # Possible ID column (very high cardinality on int)
-        if col.type_str == "int" and col.unique_pct > 95:
-            warnings.append(f"[blue]i[/blue]  '{col.name}' - {col.unique_pct:.0f}% unique. Looks like an ID column.")
-        
-        # Possible binary target column
-        if col.unique_approx <= 3 and col.type_str == "int" and col.val_min == 0 and col.val_max == 1:
-            warnings.append(f"[green]v[/green]  '{col.name}' - binary column (0/1). Good ML target candidate.")
-        
-        # Extreme outlier hint (if max >> mean by 10x)
-        if col.type_str in ("int", "float") and col.mean > 0 and col.unique_approx > 5 and col.val_max > 10:
-            if col.val_max > col.mean * 10:
-                warnings.append(f"[yellow]![/yellow]  '{col.name}' - max ({_format_num(col.val_max)}) is {col.val_max/col.mean:.0f}x above mean. Outliers likely.")
-
-    if warnings:
-        _console.print("[bold]Smart Warnings:[/bold]")
-        for i, w in enumerate(warnings):
-            if i >= 5:
-                _console.print(f"  [dim]... and {len(warnings) - 5} more warnings. (truncated for readability)[/dim]")
-                break
-            _console.print(f"  {w}")
-        _console.print()
+    warnings_list = _collect_warnings(p)
+    if warnings_list:
+        warn_lines = ["[bold]Smart Warnings:[/bold]"]
+        for w in warnings_list[:5]:
+            warn_lines.append(f"  {w}")
+        if len(warnings_list) > 5:
+            warn_lines.append(
+                f"  [dim]... and {len(warnings_list)-5} more. "
+                f"Call zd.warnings(\"{p.file_name}\") for full list.[/dim]"
+            )
+        _console.print("\n".join(warn_lines) + "\n")
 
     # ── Correlation Alerts ────────────────────────────────────────
     _correlation_alerts(p, _console)
+
+    # ── Clean Footer Summary ──────────────────────────────────────
+    _console.print(
+        f"[dim]  zedda v{__version__}  •  "
+        f"{p.num_cols} columns  •  "
+        f"{p.num_rows:,} rows  •  "
+        f"scanned in {scan_str}[/dim]\n"
+    )
 
 
 def _quality_score(p) -> int:
@@ -447,22 +508,60 @@ def _quality_score(p) -> int:
     score -= min(20, outlier_cols * 3)
     return max(0, score)
 
+
+def _quality_score_display(p: object, console) -> None:
+    score = _quality_score(p)
+    filled = score // 10
+    bar    = "█" * filled + "░" * (10 - filled)
+
+    if score >= 80:     color, label = "green", "GOOD"
+    elif score >= 60:   color, label = "yellow", "FAIR"
+    else:                 color, label = "red", "POOR"
+
+    hints = []
+    high_null = sum(1 for c in p.columns if c.has_high_nulls)
+    constant  = sum(1 for c in p.columns if c.is_constant)
+    outlier_c = sum(1 for c in p.columns
+                    if c.type_str in ("int","float")
+                    and c.unique_approx > 5
+                    and c.mean > 0
+                    and c.val_max > 10
+                    and c.val_max > c.mean * 10)
+
+    if high_null:  hints.append(f"{high_null} high-null col{'s' if high_null>1 else ''}")
+    if constant:   hints.append(f"{constant} constant col{'s' if constant>1 else ''}")
+    if outlier_c:  hints.append(f"{outlier_c} col{'s' if outlier_c>1 else ''} with outliers")
+
+    hint_str = f"  [dim]({', '.join(hints)})[/dim]" if hints else ""
+
+    console.print(
+        f"\n[bold]Data Quality Score:[/bold]  "
+        f"[{color}]{score}/100  {bar}  {label}[/{color}]"
+        f"{hint_str}\n"
+    )
+
+
 def _correlation_alerts(p, console) -> None:
     alerts = []
     for cr in p.correlations:
         if abs(cr.r) >= 0.7:
-            color = "red" if cr.strength == "very_strong" else "yellow"
-            sign = "+" if cr.r > 0 else "-"
-            alerts.append(f"[{color}]r={sign}{abs(cr.r):.2f}[/{color}]  '{cr.col_a}' <-> '{cr.col_b}' - {cr.strength.replace('_', ' ')} {cr.direction} correlation")
+            abs_r = abs(cr.r)
+            color = "red" if abs_r >= 0.9 else "yellow"
+            action = "Drop one before ML training." if abs_r >= 0.95 else "Review before feature selection."
+            sym   = "↑↑" if cr.direction == "positive" else "↑↓"
+            alerts.append(
+                f"  [{color}]{sym} r={cr.r:+.2f}[/{color}]  "
+                f"'[cyan]{cr.col_a}[/cyan]' ↔ '[cyan]{cr.col_b}[/cyan]'  "
+                f"[dim]{action}[/dim]"
+            )
             
     if alerts:
-        console.print("[bold]Pearson Correlation Alerts:[/bold] [dim](O(1) memory single-pass math)[/dim]")
-        for i, a in enumerate(alerts):
-            if i >= 5:
-                console.print(f"  [dim]... and {len(alerts) - 5} more highly correlated pairs.[/dim]")
-                break
-            console.print(f"  {a}")
-        console.print()
+        alert_lines = ["[bold]Pearson Correlation Alerts:[/bold]  [dim](single-pass O(1) math)[/dim]"]
+        for a in alerts[:5]:
+            alert_lines.append(a)
+        if len(alerts) > 5:
+            alert_lines.append(f"  [dim]... and {len(alerts)-5} more pairs.[/dim]")
+        console.print("\n".join(alert_lines) + "\n")
 
 def _print_plain(p: object) -> None:
     """Fallback plain text report when Rich is not installed."""
@@ -576,7 +675,27 @@ def _require_core():
         )
 
 
+def warnings(path: str) -> None:
+    """
+    Show ALL warnings for a file — not truncated.
+
+    Use after zd.profile() if you see '... and N more warnings'.
+
+    Example::
+        zd.warnings("data.csv")
+    """
+    p = scan(path)
+    _console.print(f"\n[bold]All Warnings for:[/bold] {Path(path).name}\n")
+    all_warnings = _collect_warnings(p)
+    if not all_warnings:
+        _console.print("  [green]No warnings — data looks clean![/green]\n")
+        return
+    for w in all_warnings:
+        _console.print(f"  {w}")
+    _console.print()
+
+
 # ─────────────────────────────────────────────────────────────────
 #  Public API
 # ─────────────────────────────────────────────────────────────────
-__all__ = ["profile", "scan", "compare", "ZeddaError", "__version__"]
+__all__ = ["profile", "scan", "compare", "warnings", "ZeddaError", "__version__"]
