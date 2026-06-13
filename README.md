@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/prince3235/zedda/main/docs/Zedda1.png" alt="Zedda Logo" width="400"/>
+  <img src="https://raw.githubusercontent.com/prince3235/zedda/main/docs/logo.png" alt="Zedda Logo" width="400"/>
   <h3>Zero Effort Data Analysis</h3>
   <p>The world's fastest EDA library — C++ powered, pip installable</p>
 
